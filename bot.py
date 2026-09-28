@@ -1,10 +1,15 @@
 """
-Bot Scalping v22.0 PAPER / LIVE MARKET — INSTITUTIONAL QUANT ENGINE (Binance Futures)
-====================================================================================
-MODE: PAPER TRADING ONLY
-- Market data: LIVE Binance Futures MAINNET public market data
-- Orders: NEVER sent to Binance
-- Entry/exit: simulated locally using live market prices
+Bot Scalping v22.0 — BINANCE FUTURES DEMO EXECUTION — INSTITUTIONAL QUANT ENGINE
+================================================================================
+MODE:
+- Market data: LIVE Binance Futures public market data
+- Orders: REAL orders are sent ONLY to Binance Futures DEMO
+- REST execution endpoint: https://demo-fapi.binance.com/fapi
+- No production/mainnet private order endpoint is used.
+- API_KEY / API_SECRET MUST be Binance Demo Trading API credentials.
+- Entry: real MARKET order on Binance Demo
+- Exit: real MARKET reduceOnly order on Binance Demo
+- TP/SL/Time/ProfitGuard logic is kept from the original engine.
 - TP = 3.5x ATR (clamped 2.5%-3.5%)
 - SL = 1.8x ATR (clamped 1.5%-2.5%)
 - Trailing Stop: removed
@@ -17,7 +22,7 @@ MODE: PAPER TRADING ONLY
     Stage 2: tambahan 60 menit
       * TP -> TP
       * SL -> SL
-      * floating PnL <= 0 -> TIME_LIMIT (protect profit from turning negative)
+      * floating PnL <= 0 -> TIME_LIMIT
       * 90 menit total -> TIME_LIMIT
 - Profit Guard dynamic berbasis ATH PnL
 - Signal Flip Exit: 1 candle 5m closed berlawanan kuat
@@ -54,17 +59,28 @@ api_key = os.getenv("API_KEY")
 api_secret = os.getenv("API_SECRET")
 
 # ============================================================================
-# HARD SAFETY LOCK: PAPER TRADING ONLY
+# BINANCE FUTURES DEMO — HARD ROUTING LOCK
 # ============================================================================
-# Mainnet is used only for LIVE PUBLIC MARKET DATA.
-# No private account endpoint and NO create/close order call is executed.
-PAPER_TRADING = True
+# IMPORTANT:
+# This build sends REAL orders, but ONLY to Binance Futures DEMO.
+# The endpoint is hard-pinned so a production/private order cannot be used.
+DEMO_TRADING = True
 LIVE_MARKET_DATA = True
+DEMO_FUTURES_BASE_URL = "https://demo-fapi.binance.com"
+DEMO_FUTURES_URL = DEMO_FUTURES_BASE_URL + "/fapi"
 
-# Client is used for public market-data REST only.
-# No account/order method is called anywhere in this paper build.
+if not api_key or not api_secret:
+    raise RuntimeError("API_KEY/API_SECRET belum diisi. Gunakan API key Binance DEMO Trading.")
+
 client = Client(api_key, api_secret)
-client.FUTURES_URL = "https://fapi.binance.com/fapi"
+
+# python-binance may select FUTURES_TESTNET_URL when testnet routing is enabled.
+# Override BOTH futures URL attributes to guarantee demo-fapi routing.
+client.FUTURES_URL = DEMO_FUTURES_URL
+client.FUTURES_TESTNET_URL = DEMO_FUTURES_URL
+
+# The market-data websocket remains public market data. Private order/account
+# execution is REST-only against the DEMO endpoint above.
 
 WS_MAX_QUEUE_SIZE = 2000
 DEPTH_SOCKET_CHUNK = 8
@@ -810,7 +826,7 @@ def _api_fail(tag):
 
 
 def _rest_call(tag, fn, *args, retries=1, **kwargs):
-    """REST gate for public market-data calls only in this paper build."""
+    """Rate-limited REST gate for Binance Futures DEMO market/account/order calls."""
     global _rest_last_ts, _rest_block_until
 
     last_exc = None
@@ -863,21 +879,205 @@ def get_precision(symbol):
         return _precision_cache[symbol]
     try:
         info = _rest_call("futures_exchange_info", client.futures_exchange_info)
-        for s in info["symbols"]:
-            if s["symbol"] == symbol:
-                prec = int(s["quantityPrecision"])
+        for item in info["symbols"]:
+            if item["symbol"] == symbol:
+                prec = int(item.get("quantityPrecision", 8))
                 _precision_cache[symbol] = prec
                 return prec
     except Exception as e:
         _log_err("get_precision", e)
-    return 2
+    return 8
+
+
+_symbol_rules_cache = {}
+
+
+def _get_symbol_rules(symbol):
+    """Return LOT_SIZE / MARKET_LOT_SIZE rules from DEMO exchangeInfo."""
+    cached = _symbol_rules_cache.get(symbol)
+    if cached:
+        return cached
+    info = _rest_call("futures_exchange_info_rules", client.futures_exchange_info)
+    for item in info.get("symbols", []):
+        if item.get("symbol") != symbol:
+            continue
+        filters = {f.get("filterType"): f for f in item.get("filters", [])}
+        lot = filters.get("MARKET_LOT_SIZE") or filters.get("LOT_SIZE") or {}
+        min_qty = float(lot.get("minQty", 0) or 0)
+        step = float(lot.get("stepSize", 0) or 0)
+        rules = {
+            "min_qty": min_qty,
+            "step_size": step,
+            "precision": int(item.get("quantityPrecision", 8)),
+        }
+        _symbol_rules_cache[symbol] = rules
+        return rules
+    raise RuntimeError(f"Symbol {symbol} tidak ditemukan di DEMO exchangeInfo")
 
 
 def qty(symbol, price):
-    # Paper mode intentionally keeps the exact target notional instead of
-    # forcing Binance lot-size rounding, because no order is sent.
+    """Calculate order quantity and round DOWN to Binance DEMO lot-size step."""
+    if price <= 0:
+        return 0.0
     raw = (ORDER_USDT * LEVERAGE) / price
-    return round(raw, 10)
+    rules = _get_symbol_rules(symbol)
+    step = rules["step_size"]
+    min_qty = rules["min_qty"]
+    precision = rules["precision"]
+
+    if step > 0:
+        raw = math.floor((raw + 1e-15) / step) * step
+
+    q_val = round(raw, precision)
+    if min_qty > 0 and q_val < min_qty:
+        return 0.0
+    return q_val
+
+
+def _fmt_qty(symbol, q_val):
+    precision = get_precision(symbol)
+    return f"{q_val:.{precision}f}"
+
+
+def _demo_position(symbol):
+    """Read the real DEMO Futures position for one symbol."""
+    rows = _rest_call(
+        f"demo_position_{symbol}",
+        client.futures_position_information,
+        symbol=symbol,
+        retries=0,
+    )
+    for p in rows or []:
+        if p.get("symbol") == symbol:
+            amt = float(p.get("positionAmt", 0) or 0)
+            if abs(amt) > 0:
+                return p
+    return None
+
+
+def _demo_set_leverage(symbol):
+    if symbol in _leverage_done:
+        return True
+    try:
+        _rest_call(
+            f"demo_set_leverage_{symbol}",
+            client.futures_change_leverage,
+            symbol=symbol,
+            leverage=LEVERAGE,
+            retries=0,
+        )
+        _leverage_done.add(symbol)
+        return True
+    except Exception as e:
+        _log_err(f"demo_set_leverage_{symbol}", e, cooldown=30)
+        return False
+
+
+def _demo_market_open(symbol, side, quantity):
+    """Send and verify a REAL MARKET entry on Binance Futures DEMO."""
+    global _order_state_uncertain
+    if not DEMO_TRADING:
+        raise RuntimeError("DEMO_TRADING must remain True")
+
+    order_side = "BUY" if side == "LONG" else "SELL"
+    q_str = _fmt_qty(symbol, quantity)
+
+    try:
+        response = _rest_call(
+            f"demo_entry_{symbol}",
+            client.futures_create_order,
+            symbol=symbol,
+            side=order_side,
+            type="MARKET",
+            quantity=q_str,
+            newOrderRespType="RESULT",
+            recvWindow=5000,
+            retries=0,
+        )
+
+        # Verify that Binance DEMO actually created the position.
+        pos = None
+        for _ in range(4):
+            time.sleep(0.15)
+            pos = _demo_position(symbol)
+            if pos is not None:
+                break
+        if pos is None:
+            _order_state_uncertain = True
+            raise RuntimeError(
+                f"ORDER SUBMITTED tetapi posisi DEMO belum terverifikasi: response={response}"
+            )
+
+        actual_amt = float(pos.get("positionAmt", 0) or 0)
+        expected_sign = 1 if side == "LONG" else -1
+        if actual_amt * expected_sign <= 0:
+            _order_state_uncertain = True
+            raise RuntimeError(
+                f"Posisi DEMO terverifikasi tetapi arah tidak cocok: expected={side}, positionAmt={actual_amt}"
+            )
+
+        _order_state_uncertain = False
+        avg_price = float(response.get("avgPrice", 0) or 0)
+        if avg_price <= 0:
+            avg_price = float(pos.get("entryPrice", 0) or 0)
+        actual_qty = abs(actual_amt)
+
+        print(
+            f"  🟢 [BINANCE DEMO ENTRY FILLED] {symbol} {side} "
+            f"qty:{actual_qty:.8g} avg:{avg_price:.8g} orderId:{response.get('orderId')}"
+        )
+        return response, pos, avg_price, actual_qty
+
+    except Exception:
+        # Never fabricate a local position after an uncertain order.
+        _order_state_uncertain = True
+        raise
+
+
+def _demo_market_close(symbol, side, quantity):
+    """Send a REAL reduceOnly MARKET close on Binance Futures DEMO."""
+    global _order_state_uncertain
+    order_side = "SELL" if side == "LONG" else "BUY"
+    q_str = _fmt_qty(symbol, quantity)
+
+    try:
+        response = _rest_call(
+            f"demo_exit_{symbol}",
+            client.futures_create_order,
+            symbol=symbol,
+            side=order_side,
+            type="MARKET",
+            quantity=q_str,
+            reduceOnly="true",
+            newOrderRespType="RESULT",
+            recvWindow=5000,
+            retries=0,
+        )
+
+        remaining = None
+        for _ in range(4):
+            time.sleep(0.15)
+            remaining = _demo_position(symbol)
+            if remaining is None:
+                break
+        if remaining is not None:
+            _order_state_uncertain = True
+            raise RuntimeError(
+                f"Close order terkirim tetapi posisi DEMO masih terbuka: "
+                f"positionAmt={remaining.get('positionAmt')}"
+            )
+
+        _order_state_uncertain = False
+        avg_price = float(response.get("avgPrice", 0) or 0)
+        print(
+            f"  🔵 [BINANCE DEMO EXIT FILLED] {symbol} {side} "
+            f"qty:{quantity:.8g} avg:{avg_price:.8g} orderId:{response.get('orderId')}"
+        )
+        return response, avg_price
+
+    except Exception:
+        _order_state_uncertain = True
+        raise
 
 
 def price_live(symbol):
@@ -1115,7 +1315,7 @@ def _activate_aux_ban(kind: str, seconds: float, trigger_sym: str):
             "PROFIT_GUARD": _profit_guard_until,
         }[label]
 
-    print(f"  🛑 [{label}] {trigger_sym} — paper entry baru diblokir sampai {time.strftime('%H:%M:%S', time.localtime(active_until))}")
+    print(f"  🛑 [{label}] {trigger_sym} — DEMO entry baru diblokir sampai {time.strftime('%H:%M:%S', time.localtime(active_until))}")
 
 
 def _estimate_floating_pnl(pos, price):
@@ -1160,7 +1360,7 @@ def _liquidate_losing_positions(reason: str, exclude=None):
             except Exception:
                 px = 0.0
         if px <= 0:
-            print(f"  ⚠️ [{reason}] {sym}: harga floating tidak tersedia — paper position dipertahankan")
+            print(f"  ⚠️ [{reason}] {sym}: harga floating tidak tersedia — DEMO position dipertahankan")
             continue
 
         fpnl = _estimate_floating_pnl(pos, px)
@@ -1191,7 +1391,7 @@ def _activate_sl_ban_and_liquidate(trigger_sym):
         _stats["sl_ban_count"] += 1
         ban_until_local = _sl_ban_until
 
-    print(f"\n  🛑 [SL CIRCUIT BAN] {trigger_sym} kena SL — paper entry dikunci 3 JAM sampai {time.strftime('%H:%M:%S', time.localtime(ban_until_local))}")
+    print(f"\n  🛑 [SL CIRCUIT BAN] {trigger_sym} kena SL — DEMO entry dikunci 3 JAM sampai {time.strftime('%H:%M:%S', time.localtime(ban_until_local))}")
     if SL_LIQUIDATE_LOSERS:
         _liquidate_losing_positions("CASCADE_AFTER_SL", exclude={trigger_sym})
 
@@ -1268,103 +1468,161 @@ def ks_upd(pnl):
 
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
-    """Paper-only open using live market price. No order is sent."""
-    if not PAPER_TRADING:
-        raise RuntimeError("SAFETY LOCK: this build must remain PAPER_TRADING=True")
+    """Open a REAL position on Binance Futures DEMO and mirror the verified fill locally."""
+    if not DEMO_TRADING:
+        raise RuntimeError("DEMO_TRADING must remain True")
     if orig_direction not in ("LONG", "SHORT"):
         return
-
-    execution_side = orig_direction
+    if _order_state_uncertain:
+        print(f"  ⛔ [{sym}] ENTRY DIBLOKIR: ORDER_STATE_UNKNOWN")
+        return
 
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
             return
         live_positions[sym] = {"_r": True}
 
-    px_now = price_live(sym)
-    if px_now > 0:
-        price = px_now
-
     try:
+        px_now = price_live(sym)
+        if px_now > 0:
+            price = px_now
+        if price <= 0:
+            raise ValueError("Harga entry tidak tersedia")
+
+        if not _demo_set_leverage(sym):
+            raise RuntimeError(f"Gagal set leverage DEMO {LEVERAGE}x untuk {sym}")
+
         q_val = qty(sym, price)
         if q_val <= 0:
-            raise ValueError("quantity <= 0")
+            raise ValueError(
+                f"Quantity DEMO <= 0 setelah LOT_SIZE rounding untuk {sym}. "
+                f"ORDER_USDT={ORDER_USDT}, leverage={LEVERAGE}"
+            )
+
+        response, account_pos, fill_price, actual_qty = _demo_market_open(
+            sym, orig_direction, q_val
+        )
+
+        if fill_price <= 0:
+            raise RuntimeError(f"Fill price DEMO tidak valid: {fill_price}")
+
+        new_risk = DynamicRiskManager.calculate_levels(
+            fill_price, orig_direction, atr
+        )
+        now = time.time()
+
+        pos = {
+            "side": orig_direction,
+            "orig_signal": orig_direction,
+            "entry": fill_price,
+            "qty": actual_qty,
+            "open_time": now,
+            "score": score,
+            "sigs": sigs,
+            "atr": atr,
+            "regime": regime,
+            "bias": bias,
+            "tp_pct": new_risk["tp_pct"],
+            "sl_pct": new_risk["sl_pct"],
+            "tp_price": new_risk["tp_price"],
+            "sl_price": new_risk["sl_price"],
+            "peak_price": fill_price,
+            "order_id": response.get("orderId"),
+            "account_entry_price": float(account_pos.get("entryPrice", fill_price) or fill_price),
+            "time_stage": 1,
+            "stage1_deadline": now + TIME_LIMIT_STAGE1_SECONDS,
+            "grace_until": None,
+            "grace_start_pnl": None,
+            "_time_grace_warned": False,
+        }
+
+        with _lock:
+            live_positions[sym] = pos
+
+        print(
+            f"\n  🚀 [DEMO REAL ENTRY] {sym} {orig_direction} @ {fill_price:.8g} "
+            f"| qty:{actual_qty:.8g} | leverage:{LEVERAGE}x "
+            f"| TP:{new_risk['tp_pct']*100:.2f}% | SL:{new_risk['sl_pct']*100:.2f}%"
+        )
+        print(f"         Signals: {' | '.join(sigs[:6])}")
+        _stats["trades"] += 1
+        if any("Absorb" in s for s in sigs):
+            _stats["absorb_entries"] += 1
+
     except Exception as e:
-        _log_err(f"qty_{sym}", e)
         with _lock:
             live_positions.pop(sym, None)
-        return
-
-    # Simulated fill: use the live market price currently available.
-    fill_price = price
-    if fill_price <= 0:
-        with _lock:
-            live_positions.pop(sym, None)
-        return
-
-    new_risk = DynamicRiskManager.calculate_levels(fill_price, execution_side, atr)
-    now = time.time()
-    pos = {
-        "side": execution_side,
-        "orig_signal": orig_direction,
-        "entry": fill_price,
-        "qty": q_val,
-        "open_time": now,
-        "score": score,
-        "sigs": sigs,
-        "atr": atr,
-        "regime": regime,
-        "bias": bias,
-        "tp_pct": new_risk["tp_pct"],
-        "sl_pct": new_risk["sl_pct"],
-        "tp_price": new_risk["tp_price"],
-        "sl_price": new_risk["sl_price"],
-        "peak_price": fill_price,
-        # Two-stage time engine state
-        "time_stage": 1,
-        "stage1_deadline": now + TIME_LIMIT_STAGE1_SECONDS,
-        "grace_until": None,
-        "grace_start_pnl": None,
-        "_time_grace_warned": False,
-    }
-
-    with _lock:
-        live_positions[sym] = pos
-
-    print(f"\n  📝 [PAPER LIVE-MARKET] {sym} {execution_side} @ {fill_price:.6g} | qty:{q_val:.8g} | TP:{new_risk['tp_pct']*100:.2f}% | SL:{new_risk['sl_pct']*100:.2f}%")
-    print(f"         Signals: {' | '.join(sigs[:6])}")
-    _stats["trades"] += 1
-    if any("Absorb" in s for s in sigs):
-        _stats["absorb_entries"] += 1
+        _log_err(f"DEMO_ENTRY_{sym}", e, cooldown=2)
+        print(f"  ❌ [DEMO ENTRY GAGAL] {sym} {orig_direction}: {e}")
 
 
 def live_close(sym, reason, price=None):
-    """Paper-only close. No reduceOnly or close order is sent."""
-    if not PAPER_TRADING:
-        raise RuntimeError("SAFETY LOCK: this build must remain PAPER_TRADING=True")
+    """Close the REAL Binance Futures DEMO position, then record the verified fill locally."""
+    global _order_state_uncertain
+
+    if not DEMO_TRADING:
+        raise RuntimeError("DEMO_TRADING must remain True")
 
     with _lock:
-        pos = live_positions.pop(sym, None)
+        pos = live_positions.get(sym)
     if pos is None or pos.get("_r"):
         return
 
-    if price is None or price <= 0:
-        price = price_live(sym)
-    if price <= 0:
-        # Restore position if market price cannot be established.
-        with _lock:
-            live_positions[sym] = pos
+    # Always use the actual exchange position size, not a simulated quantity.
+    try:
+        account_pos = _demo_position(sym)
+    except Exception as e:
+        _order_state_uncertain = True
+        _log_err(f"DEMO_POSITION_BEFORE_CLOSE_{sym}", e, cooldown=2)
         return
 
-    side = pos["side"]
-    entry = pos["entry"]
-    q_val = pos["qty"]
+    if account_pos is None:
+        # Position may already have been closed outside this process.
+        print(f"  ⚠️ [DEMO SYNC] {sym}: posisi lokal ada tetapi posisi DEMO sudah tidak ada.")
+        with _lock:
+            live_positions.pop(sym, None)
+        _order_state_uncertain = False
+        return
 
-    gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
+    actual_amt = float(account_pos.get("positionAmt", 0) or 0)
+    if abs(actual_amt) <= 0:
+        with _lock:
+            live_positions.pop(sym, None)
+        return
+
+    side = "LONG" if actual_amt > 0 else "SHORT"
+    q_val = abs(actual_amt)
+    entry = float(account_pos.get("entryPrice", pos.get("entry", 0)) or pos.get("entry", 0))
+
+    # Price is only used as fallback for local accounting; exchange fill is preferred.
+    if price is None or price <= 0:
+        price = price_live(sym)
+
+    try:
+        response, fill_price = _demo_market_close(sym, side, q_val)
+        if fill_price <= 0:
+            fill_price = price_live(sym)
+        if fill_price <= 0:
+            fill_price = price
+        if fill_price <= 0:
+            raise RuntimeError("Harga fill exit DEMO tidak tersedia")
+
+    except Exception as e:
+        # Keep local position because the exchange position could still be open.
+        with _lock:
+            live_positions[sym] = pos
+        _log_err(f"DEMO_EXIT_{sym}", e, cooldown=2)
+        print(f"  ❌ [DEMO EXIT GAGAL] {sym} {side}: {e}")
+        return
+
+    with _lock:
+        live_positions.pop(sym, None)
+
+    gross_pnl = (fill_price - entry) * q_val if side == "LONG" else (entry - fill_price) * q_val
     fee_rate = 0.0005
-    total_fee = (entry * q_val + price * q_val) * fee_rate
+    total_fee = (entry * q_val + fill_price * q_val) * fee_rate
     pnl = gross_pnl - total_fee
-    pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
+    pct = (fill_price - entry) / entry * 100 if side == "LONG" else (entry - fill_price) / entry * 100
     hold = time.time() - pos["open_time"]
     won = pnl >= 0
     e_icon = "🟢" if won else "🔴"
@@ -1372,14 +1630,20 @@ def live_close(sym, reason, price=None):
     peak_px = pos.get("peak_price", entry)
     peak_pct = (peak_px - entry) / entry if side == "LONG" else (entry - peak_px) / entry
 
-    print(f"  {e_icon} [PAPER ENGINE v22] {sym} {side} CLOSE — {reason} | peak:{peak_pct*100:+.3f}%")
-    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
+    print(
+        f"  {e_icon} [BINANCE DEMO EXIT] {sym} {side} CLOSE — {reason} "
+        f"| peak:{peak_pct*100:+.3f}%"
+    )
+    print(
+        f"     {entry:.8g}→{fill_price:.8g} ({pct:+.3f}%) hold:{hold:.0f}s "
+        f"| PnL:{pnl:+.5f}U"
+    )
 
     trade = TradeRecord(
         symbol=sym,
         direction=side,
         entry_price=entry,
-        exit_price=price,
+        exit_price=fill_price,
         pnl=pnl,
         won=won,
         regime=pos.get("regime", "UNKNOWN"),
@@ -1419,13 +1683,13 @@ def live_close(sym, reason, price=None):
         "sym": sym,
         "side": side,
         "entry": round(entry, 7),
-        "exit": round(price, 7),
+        "exit": round(fill_price, 7),
         "pnl": round(pnl, 5),
         "reason": reason,
         "hold": int(hold),
+        "order_id": response.get("orderId"),
     })
 
-    # Circuit actions based on exit type.
     if reason == "SL":
         _activate_sl_ban_and_liquidate(sym)
     elif reason == "CASCADE_AFTER_SL":
@@ -1440,6 +1704,7 @@ def live_close(sym, reason, price=None):
     _hot_syms.appendleft(sym)
     _rescan_q.put(1)
     print_inline()
+
 
 
 def _activate_time_grace(sym, pos, floating_pnl):
@@ -1677,7 +1942,7 @@ def print_inline():
     aw = learning.avg_win()
     avg_pk = learning.avg_peak_win()
     e = "💚" if pnl >= 0 else "🔴"
-    print(f"       ┌ [PAPER ENGINE v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
+    print(f"       ┌ [DEMO ENGINE v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
     circuit, _ = _circuit_snapshot()
     print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | Circuit:{circuit or 'READY'} | Cascade:{_stats['sl_cascade_closes']} | FlipExit:{_stats['signal_flip_exits']} | Grace:{_stats['time_grace_entries']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
@@ -1693,7 +1958,7 @@ def print_full():
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
 
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING v22 PAPER — LIVE MARKET DATA")
+    print(f"    🔔 INSTITUTIONAL SCALPING v22 DEMO — LIVE MARKET DATA")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U | Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | Grace:{_stats['time_grace_entries']} | GraceDrawdown:{_stats['time_grace_exits']}")
@@ -1942,53 +2207,143 @@ def t_ws_watchdog():
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def run_bot():
-    if not PAPER_TRADING:
-        raise RuntimeError("SAFETY LOCK FAILED: PAPER_TRADING must remain True")
+def demo_preflight_account(syms):
+    """Verify API credentials are valid for Binance Futures DEMO and no bot position is already open."""
+    global _order_state_uncertain
 
+    if not DEMO_TRADING:
+        raise RuntimeError("DEMO_TRADING harus True")
+
+    if "demo-fapi.binance.com" not in str(getattr(client, "FUTURES_URL", "")):
+        raise RuntimeError(
+            f"SAFETY ROUTING FAILED: Futures URL bukan DEMO: {getattr(client, 'FUTURES_URL', None)}"
+        )
+
+    try:
+        account = _rest_call(
+            "demo_account_preflight",
+            client.futures_account,
+            retries=0,
+        )
+        if not isinstance(account, dict):
+            raise RuntimeError("response futures_account DEMO tidak valid")
+
+        print(
+            f"  ✅ DEMO API terhubung | canTrade:{account.get('canTrade')} "
+            f"| availableBalance:{account.get('availableBalance', 'n/a')} USDT"
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "API_KEY/API_SECRET tidak valid untuk Binance Futures DEMO, "
+            f"atau endpoint DEMO tidak dapat diakses: {e}"
+        ) from e
+
+    try:
+        mode = _rest_call(
+            "demo_position_mode",
+            client.futures_get_position_mode,
+            retries=0,
+        )
+        if bool(mode.get("dualSidePosition")):
+            raise RuntimeError(
+                "Akun DEMO memakai Hedge Mode. Bot ini memakai One-Way Mode; "
+                "ubah Position Mode Binance DEMO ke One-Way."
+            )
+    except AttributeError:
+        print("  ⚠️ futures_get_position_mode tidak tersedia pada versi python-binance ini; lanjut.")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Gagal membaca Position Mode DEMO: {e}") from e
+
+    try:
+        positions = _rest_call(
+            "demo_positions_preflight",
+            client.futures_position_information,
+            retries=0,
+        )
+        wanted = set(syms)
+        active = []
+        for p in positions or []:
+            sym = p.get("symbol")
+            amt = float(p.get("positionAmt", 0) or 0)
+            if sym in wanted and abs(amt) > 0:
+                active.append((sym, amt))
+        if active:
+            raise RuntimeError(
+                f"Masih ada posisi DEMO terbuka pada symbol bot: {active}. "
+                "Tutup/sinkronkan dulu agar state lokal tidak berbeda dari akun DEMO."
+            )
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Gagal membaca posisi DEMO: {e}") from e
+
+    _order_state_uncertain = False
+    print("  🟢 DEMO ORDER ROUTING: AKTIF — MARKET ENTRY/EXIT benar-benar dikirim ke Binance DEMO")
+
+
+def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print(f"║  MODE: PAPER ONLY | REAL BINANCE MARKET DATA                     ║")
-    print(f"║  WS protection: queue={WS_MAX_QUEUE_SIZE} | depth chunks={DEPTH_SOCKET_CHUNK} | mark fast={MARK_PRICE_FAST} ║")
-    print("║  💎 BOT SCALPING v22.0 PAPER — LIVE MARKET                       ║")
-    print("║  1. Signal LONG -> PAPER LONG | Signal SHORT -> PAPER SHORT      ║")
-    print("║  2. TP = 2.5–3.5% (3.5x ATR capped)                              ║")
-    print("║  3. SL = 1.5–2.5% (1.8x ATR capped)                              ║")
-    print("║  4. SL = BAN 3 JAM + CLOSE POSISI LAIN YANG SEDANG LOSS          ║")
-    print("║  5. TIME: 30m -> GRACE +60m if profit -> MAX 90m                 ║")
-    print("║  6. GRACE PnL <= 0 -> CLOSE TIME_LIMIT + BAN 1 JAM              ║")
-    print("║  7. Profit Guard + Signal Flip aktif                             ║")
-    print("║  8. SAFETY: TIDAK ADA ORDER/LEVERAGE/ACCOUNT CALL                ║")
+    print("║  💎 BOT SCALPING v22.0 — BINANCE FUTURES DEMO EXECUTION         ║")
+    print("║  1. Signal LONG -> REAL DEMO MARKET BUY                         ║")
+    print("║  2. Signal SHORT -> REAL DEMO MARKET SELL                       ║")
+    print("║  3. EXIT -> REAL DEMO reduceOnly MARKET                         ║")
+    print("║  4. TP = 2.5–3.5% | SL = 1.5–2.5%                              ║")
+    print("║  5. SL BAN 3 JAM + CLOSE POSISI LAIN YANG LOSS                  ║")
+    print("║  6. TIME: 30m -> GRACE +60m -> MAX 90m                         ║")
+    print("║  7. Profit Guard + Signal Flip aktif                            ║")
+    print("║  8. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY            ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
 
     try:
         valid = {
             s["symbol"]
-            for s in _rest_call("startup_exchange_info", client.futures_exchange_info, retries=0)["symbols"]
+            for s in _rest_call(
+                "startup_exchange_info",
+                client.futures_exchange_info,
+                retries=0,
+            )["symbols"]
             if s["status"] == "TRADING"
         }
     except Exception as e:
-        raise RuntimeError(f"Gagal membaca live exchangeInfo market: {e}") from e
+        raise RuntimeError(f"Gagal membaca exchangeInfo Binance DEMO: {e}") from e
 
     syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
     if not syms:
-        raise RuntimeError("Tidak ada symbol paper yang valid pada Binance Futures market")
+        raise RuntimeError("Tidak ada symbol bot yang valid pada Binance Futures DEMO")
 
-    print(f"  ✅ Live market source: https://fapi.binance.com | Paper symbols: {len(syms)}")
-    print("  🛡️ PAPER SAFETY: account preflight/order endpoint DISABLED")
+    print(f"  ✅ DEMO Futures REST: {DEMO_FUTURES_BASE_URL} | Symbols: {len(syms)}")
+    demo_preflight_account(syms)
+
     bootstrap_all_klines(syms)
 
+    # Public market streams are used for signal/price data.
+    # Private execution remains hard-pinned to demo-fapi REST.
     twm.start()
     twm.start_all_mark_price_socket(callback=handle_mark_price, fast=MARK_PRICE_FAST)
-    twm.start_futures_multiplex_socket(callback=handle_all_ticker, streams=["!ticker@arr"])
+    twm.start_futures_multiplex_socket(
+        callback=handle_all_ticker,
+        streams=["!ticker@arr"],
+    )
 
     kline_streams = [f"{s.lower()}@kline_5m" for s in syms]
-    twm.start_futures_multiplex_socket(callback=handle_kline_multiplex, streams=kline_streams)
-    twm.start_futures_multiplex_socket(callback=handle_btc_aggtrade, streams=["btcusdt@aggtrade"])
+    twm.start_futures_multiplex_socket(
+        callback=handle_kline_multiplex,
+        streams=kline_streams,
+    )
+    twm.start_futures_multiplex_socket(
+        callback=handle_btc_aggtrade,
+        streams=["btcusdt@aggtrade"],
+    )
 
     for i in range(0, len(syms), DEPTH_SOCKET_CHUNK):
         chunk = syms[i:i + DEPTH_SOCKET_CHUNK]
         depth_streams = [f"{s.lower()}@depth10" for s in chunk]
-        twm.start_futures_multiplex_socket(callback=handle_depth_multiplex, streams=depth_streams)
+        twm.start_futures_multiplex_socket(
+            callback=handle_depth_multiplex,
+            streams=depth_streams,
+        )
         time.sleep(0.15)
 
     threading.Thread(target=t_ws_watchdog, daemon=True).start()
@@ -2009,30 +2364,40 @@ def run_bot():
         ws_flag = f" | ⚠️WS_IDLE:{ws_idle:.0f}s" if ws_idle > WS_STALE_SEC else ""
 
         btc_status = btc_macro.get_status_str()
-        veto_summary = f"Veto[Wall:{_stats['wall_veto']}|BTC:{_stats['btc_breaker_veto']}|Spoof:{_stats['spoof_veto']}]"
+        veto_summary = (
+            f"Veto[Wall:{_stats['wall_veto']}|"
+            f"BTC:{_stats['btc_breaker_veto']}|"
+            f"Spoof:{_stats['spoof_veto']}]"
+        )
         circuit_status, _ = _circuit_snapshot()
         circuit_flag = f" | 🛑 {circuit_status}" if circuit_status else ""
 
-        print(f"  #{cycle} {time.strftime('%H:%M:%S')} PAPER/LIVE-MARKET BTC_5M:{_macro['btc']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U) | {veto_summary}{circuit_flag}{api_flag}{ws_flag}")
+        print(
+            f"  #{cycle} {time.strftime('%H:%M:%S')} "
+            f"BINANCE-DEMO BTC_5M:{_macro['btc']} "
+            f"({len(live_positions)}/{MAX_POSITIONS}) "
+            f"PnL:{_stats['pnl']:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U) | "
+            f"{veto_summary}{circuit_flag}{api_flag}{ws_flag}"
+        )
         print(f"        ↳ {btc_status}")
 
         if (k := ks_check())[0]:
             print(f"  🚨 KS:{k[1]}")
         elif slots == 0:
-            # Do not claim TP/SL Only: Signal Flip and the time engine are also active.
-            print(f"  ✅ Slots full — monitoring TP/SL + TIME ENGINE + SIGNAL FLIP")
+            print("  ✅ Slots full — monitoring REAL DEMO positions + TP/SL + TIME ENGINE + SIGNAL FLIP")
         else:
-            print(f"  🔍 {slots} slot kosong — scanning order book & flow...")
+            print(f"  🔍 {slots} slot kosong — scanning untuk REAL DEMO entry...")
 
         if cycle % 30 == 0:
             print_full()
         time.sleep(SCAN_INTERVAL)
 
 
+
 if __name__ == "__main__":
     try:
         run_bot()
     except KeyboardInterrupt:
-        print("\n🛑 Bot paper dihentikan manual.")
+        print("\n🛑 Bot Binance DEMO dihentikan manual.")
     except Exception as e:
         print(f"\n❌ BOT STARTUP STOP: {type(e).__name__}: {e}")
