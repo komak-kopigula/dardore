@@ -1,7 +1,7 @@
 """
 Bot Scalping v22.0 — BINANCE FUTURES DEMO EXECUTION — INSTITUTIONAL QUANT ENGINE
 ================================================================================
-MODE:
+MODE
 - Market data: LIVE Binance Futures public market data
 - Orders: REAL orders are sent ONLY to Binance Futures DEMO
 - REST execution endpoint: https://demo-fapi.binance.com/fapi
